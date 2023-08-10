@@ -122,6 +122,25 @@ var (
 		},
 		[]string{"cidr"},
 	)
+	noAvailableAddrs = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "awscni_error_no_available_addrs",
+			Help: "The number of IP/Prefix assignments that fail due to no available addresses at the ENI level",
+		},
+	)
+	netIPCnt = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "awscni_warm_net_req_count",
+			Help: "The number of net warm pool IP address requests",
+		},
+	)
+	eniUtilization = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "awscni_eni_utilization",
+			Help: "The number of allocated ips partitioned by eni",
+		},
+		[]string{"fn"},
+	)
 	prometheusRegistered = false
 )
 
@@ -334,6 +353,9 @@ func prometheusRegister() {
 		prometheus.MustRegister(forceRemovedIPs)
 		prometheus.MustRegister(totalPrefixes)
 		prometheus.MustRegister(ipsPerCidr)
+		prometheus.MustRegister(noAvailableAddrs)
+		prometheus.MustRegister(netIPCnt)
+		prometheus.MustRegister(eniUtilization)
 		prometheusRegistered = true
 	}
 }
@@ -700,6 +722,7 @@ func (ds *DataStore) AssignPodIPv6Address(ipamKey IPAMKey, ipamMetadata IPAMMeta
 				delete(V6Cidr.IPAddresses, addr.Address)
 				return "", -1, err
 			}
+			netIPCnt.Inc()
 			return addr.Address, eni.DeviceNumber, nil
 		}
 	}
@@ -765,11 +788,13 @@ func (ds *DataStore) AssignPodIPv4Address(ipamKey IPAMKey, ipamMetadata IPAMMeta
 				ipsPerCidr.With(prometheus.Labels{"cidr": availableCidr.Cidr.String()}).Dec()
 				return "", -1, err
 			}
+			netIPCnt.Inc()
 			return addr.Address, eni.DeviceNumber, nil
 		}
 		ds.log.Debugf("AssignPodIPv4Address: ENI %s does not have available addresses", eni.ID)
 	}
 
+	noAvailableAddrs.Inc()
 	ds.log.Errorf("DataStore has no available IP/Prefix addresses")
 	return "", -1, errors.New("assignPodIPv4AddressUnsafe: no available IP/Prefix addresses")
 }
@@ -797,6 +822,7 @@ func (ds *DataStore) unassignPodIPAddressUnsafe(addr *AddressInfo) {
 		// Already unassigned
 		return
 	}
+	netIPCnt.Dec()
 	ds.log.Infof("UnAssignPodIPAddress: Unassign IP %v from sandbox %s",
 		addr.Address, addr.IPAMKey)
 	addr.IPAMKey = IPAMKey{} // unassign the addr
@@ -1164,11 +1190,14 @@ func (ds *DataStore) AllocatedIPs() []PodIPInfo {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
+	eniUtilization.Reset()
 	ret := make([]PodIPInfo, 0, ds.eniPool.AssignedIPv4Addresses())
 	for _, eni := range ds.eniPool {
+		count := 0
 		for _, assignedaddr := range eni.AvailableIPv4Cidrs {
 			for _, addr := range assignedaddr.IPAddresses {
 				if addr.Assigned() {
+					count += 1
 					info := PodIPInfo{
 						IPAMKey:      addr.IPAMKey,
 						IP:           addr.Address,
@@ -1178,6 +1207,9 @@ func (ds *DataStore) AllocatedIPs() []PodIPInfo {
 				}
 			}
 		}
+		utilization := count
+		eniID := eni.ID
+		eniUtilization.WithLabelValues(eniID).Set(float64(utilization))
 	}
 	return ret
 }
