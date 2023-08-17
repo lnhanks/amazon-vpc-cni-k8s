@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -121,6 +122,32 @@ var (
 			Help: "The total number of IP addresses assigned per cidr",
 		},
 		[]string{"cidr"},
+	)
+	noAvailableAddrs = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "awscni_err_no_avail_addrs",
+			Help: "The number of IP/Prefix assignments that fail due to no available addresses at the ENI level",
+		},
+	)
+	netIPCnt = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "awscni_warm_net_req_count",
+			Help: "The number of net warm pool IP address requests",
+		},
+	)
+	eniUtilization = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "awscni_eni_util",
+			Help: "The number of allocated ips partitioned by eni",
+		},
+		[]string{"fn"},
+	)
+	netIPCnt24 = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "awscni_24_warm_net_req_count",
+			Help: "The number of net warm pool IP address requests over the past 24 hours",
+		},
+		[]string{"fn"},
 	)
 	prometheusRegistered = false
 )
@@ -313,6 +340,8 @@ type DataStore struct {
 	backingStore    Checkpointer
 	netLink         netlinkwrapper.NetLink
 	isPDEnabled     bool
+	lastHour        int
+	ipReqMap        map[int]int
 }
 
 // ENIInfos contains ENI IP information
@@ -334,6 +363,10 @@ func prometheusRegister() {
 		prometheus.MustRegister(forceRemovedIPs)
 		prometheus.MustRegister(totalPrefixes)
 		prometheus.MustRegister(ipsPerCidr)
+		prometheus.MustRegister(noAvailableAddrs)
+		prometheus.MustRegister(netIPCnt)
+		prometheus.MustRegister(eniUtilization)
+		prometheus.MustRegister(netIPCnt24)
 		prometheusRegistered = true
 	}
 }
@@ -347,6 +380,8 @@ func NewDataStore(log logger.Logger, backingStore Checkpointer, isPDEnabled bool
 		backingStore: backingStore,
 		netLink:      netlinkwrapper.NewNetLink(),
 		isPDEnabled:  isPDEnabled,
+		lastHour:     time.Now().Hour(),
+		ipReqMap:     make(map[int]int),
 	}
 }
 
@@ -511,6 +546,7 @@ func (ds *DataStore) AddENI(eniID string, deviceNumber int, isPrimary, isTrunk, 
 		AvailableIPv4Cidrs: make(map[string]*CidrInfo)}
 
 	enis.Set(float64(len(ds.eniPool)))
+	ds.GetENIUtilization()
 	return nil
 }
 
@@ -700,9 +736,16 @@ func (ds *DataStore) AssignPodIPv6Address(ipamKey IPAMKey, ipamMetadata IPAMMeta
 				delete(V6Cidr.IPAddresses, addr.Address)
 				return "", -1, err
 			}
+
+			// Dynamic Warm Pool
+			netIPCnt.Inc()
+			ds.IncIPReqHist()
+			ds.log.Debugf("Adding ip request to netIPCnt")
 			return addr.Address, eni.DeviceNumber, nil
 		}
 	}
+	noAvailableAddrs.Inc()
+	ds.log.Errorf("DataStore has no available Prefix addresses")
 	return "", -1, errors.New("assignPodIPv6AddressUnsafe: no available IP addresses")
 }
 
@@ -767,9 +810,14 @@ func (ds *DataStore) AssignPodIPv4Address(ipamKey IPAMKey, ipamMetadata IPAMMeta
 			}
 			return addr.Address, eni.DeviceNumber, nil
 		}
+		// Dynamic Warm Pool
+		netIPCnt.Inc()
+		ds.IncIPReqHist()
+		ds.log.Debugf("Adding ip request to netIPCnt")
 		ds.log.Debugf("AssignPodIPv4Address: ENI %s does not have available addresses", eni.ID)
 	}
 
+	noAvailableAddrs.Inc()
 	ds.log.Errorf("DataStore has no available IP/Prefix addresses")
 	return "", -1, errors.New("assignPodIPv4AddressUnsafe: no available IP/Prefix addresses")
 }
@@ -804,6 +852,10 @@ func (ds *DataStore) unassignPodIPAddressUnsafe(addr *AddressInfo) {
 	ds.assigned--
 	// Prometheus gauge
 	assignedIPs.Set(float64(ds.assigned))
+	// Dynamic Warm Pool
+	ds.log.Debugf("Removing ip request from netIPCnt")
+	ds.DecIPReqHist()
+	netIPCnt.Dec()
 }
 
 type DataStoreStats struct {
@@ -853,6 +905,58 @@ func (ds *DataStore) GetIPStats(addressFamily string) *DataStoreStats {
 		}
 	}
 	return stats
+}
+
+func (ds *DataStore) GetDynWarmIPReq() int {
+	netIPCnt24.Reset()
+	count := 0
+	// if map is completely empty, not able to iterate?
+
+	for k, v := range ds.ipReqMap {
+		count += v
+		// Prometheus metric
+		netIPCnt24.WithLabelValues(strconv.Itoa(k)).Set(float64(v))
+	}
+	return count
+}
+
+func (ds *DataStore) IncIPReqHist() {
+	currentHour := time.Now().Hour()
+	if ds.lastHour != currentHour {
+		ds.ipReqMap[currentHour] = 0
+		ds.lastHour = currentHour
+	}
+	if currentHour == ds.lastHour {
+		ds.ipReqMap[currentHour]++
+	}
+}
+
+func (ds *DataStore) DecIPReqHist() {
+	currentHour := time.Now().Hour()
+	if ds.lastHour != currentHour {
+		ds.ipReqMap[currentHour] = 0
+		ds.lastHour = currentHour
+	}
+	if currentHour == ds.lastHour {
+		ds.ipReqMap[currentHour]--
+	}
+}
+
+func (ds *DataStore) GetENIUtilization() {
+	eniUtilization.Reset()
+	for _, eni := range ds.eniPool {
+		count := 0
+		for _, assignedAddr := range eni.AvailableIPv4Cidrs {
+			for _, addr := range assignedAddr.IPAddresses {
+				if addr.Assigned() {
+					count += 1
+				}
+			}
+		}
+		utilization := count
+		eniID := eni.ID
+		eniUtilization.WithLabelValues(eniID).Set(float64(utilization))
+	}
 }
 
 // GetTrunkENI returns the trunk ENI ID or an empty string
@@ -1061,6 +1165,7 @@ func (ds *DataStore) RemoveUnusedENIFromStore(warmIPTarget, minimumIPTarget, war
 
 	// Prometheus update
 	enis.Set(float64(len(ds.eniPool)))
+	ds.GetENIUtilization()
 	totalIPs.Set(float64(ds.total))
 	return removableENI
 }
@@ -1115,6 +1220,7 @@ func (ds *DataStore) RemoveENIFromDataStore(eniID string, force bool) error {
 
 	// Prometheus gauge
 	enis.Set(float64(len(ds.eniPool)))
+	ds.GetENIUtilization()
 	return nil
 }
 

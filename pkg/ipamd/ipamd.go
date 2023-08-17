@@ -147,6 +147,9 @@ const (
 	envWarmPrefixTarget     = "WARM_PREFIX_TARGET"
 	defaultWarmPrefixTarget = 0
 
+	//envEnableDynWarmPool Env variable to enable/disable dynamic warm pool for IPv4 mode
+	envEnableDynWarmPool = "ENABLE_DYNAMIC_WARM_POOL"
+
 	//envEnableIPv4 - Env variable to enable/disable IPv4 mode
 	envEnableIPv4 = "ENABLE_IPv4"
 
@@ -236,6 +239,12 @@ var (
 		},
 		[]string{"fn"},
 	)
+	dynWarmPool = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "awscni_dyn_warm_pool",
+			Help: "count if IPv4 dynamic warm pool enabled",
+		},
+	)
 	prometheusRegistered = false
 )
 
@@ -270,6 +279,7 @@ type IPAMContext struct {
 	myNodeName                string
 	enablePrefixDelegation    bool
 	lastInsufficientCidrError time.Time
+	enableDynWarmPool         bool
 	enableManageUntaggedMode  bool
 	enablePodIPAnnotation     bool
 }
@@ -350,6 +360,7 @@ func prometheusRegister() {
 		prometheus.MustRegister(addIPCnt)
 		prometheus.MustRegister(delIPCnt)
 		prometheus.MustRegister(podENIErr)
+		prometheus.MustRegister(dynWarmPool)
 		prometheusRegistered = true
 	}
 }
@@ -390,6 +401,7 @@ func New(rawK8SClient client.Client, cachedK8SClient client.Client) (*IPAMContex
 	c.useCustomNetworking = UseCustomNetworkCfg()
 	c.manageENIsNonScheduleable = ManageENIsOnNonSchedulableNode()
 	c.enablePrefixDelegation = usePrefixDelegation()
+	c.enableDynWarmPool = isDynWarmPoolEnabled()
 	c.enableIPv4 = isIPv4Enabled()
 	c.enableIPv6 = isIPv6Enabled()
 	c.disableENIProvisioning = disableENIProvisioning()
@@ -403,7 +415,6 @@ func New(rawK8SClient client.Client, cachedK8SClient client.Client) (*IPAMContex
 	c.reconcileCooldownCache.cache = make(map[string]time.Time)
 	// WARM and Min IP/Prefix targets are ignored in IPv6 mode
 	c.warmENITarget = getWarmENITarget()
-	c.warmIPTarget = getWarmIPTarget()
 	c.minimumIPTarget = getMinimumIPTarget()
 	c.warmPrefixTarget = getWarmPrefixTarget()
 	c.enablePodENI = enablePodENI()
@@ -425,6 +436,13 @@ func New(rawK8SClient client.Client, cachedK8SClient client.Client) (*IPAMContex
 	c.myNodeName = os.Getenv(envNodeName)
 	checkpointer := datastore.NewJSONFile(dsBackingStorePath())
 	c.dataStore = datastore.NewDataStore(log, checkpointer, c.enablePrefixDelegation)
+
+	// Dynamic Warm Pool Mode
+	if c.enableDynWarmPool {
+		c.warmIPTarget = c.getDynWarmIPTarget()
+	} else {
+		c.warmIPTarget = getWarmIPTarget()
+	}
 
 	if err := c.nodeInit(); err != nil {
 		return nil, err
@@ -682,8 +700,19 @@ func (c *IPAMContext) StartNodeIPPoolManager() {
 			time.Sleep(sleepDuration)
 			c.updateIPPoolIfRequired(ctx)
 		}
-		time.Sleep(sleepDuration)
+		c.updateWarmPool()
 		c.nodeIPPoolReconcile(ctx, nodeIPPoolReconcileInterval)
+	}
+}
+
+// If dynamic warm pool is enabled or no longer enabled, get warm pool
+func (c *IPAMContext) updateWarmPool() {
+	if c.enableDynWarmPool {
+		c.warmIPTarget = c.getDynWarmIPTarget()
+		// Prometheus metric
+		dynWarmPool.Set(float64(c.warmIPTarget))
+	} else {
+		c.warmIPTarget = getWarmIPTarget()
 	}
 }
 
@@ -1739,6 +1768,12 @@ func dsBackingStorePath() string {
 	return defaultBackingStorePath
 }
 
+func (c *IPAMContext) getDynWarmIPTarget() int {
+	result := c.getDynWarmIPReq()
+	log.Debugf("DYNAMIC WARM POOL ENABLED: Using WARM_IP_TARGET %v", result)
+	return result
+}
+
 func getWarmIPTarget() int {
 	inputStr, found := os.LookupEnv(envWarmIPTarget)
 
@@ -1753,6 +1788,19 @@ func getWarmIPTarget() int {
 		}
 	}
 	return noWarmIPTarget
+}
+
+func (c *IPAMContext) getDynWarmIPReq() int {
+	// add up from the datastore hours 0 - 23
+	dynWarmIPReq := c.dataStore.GetDynWarmIPReq()
+	c.dataStore.GetENIUtilization()
+	// If warm pool ip requests over a given time interval are less than or equal 0, keep a warm pool base amount ahead
+	// Should the dynamic warm pool base be something the customer can set?
+	if dynWarmIPReq <= 0 {
+		// If you change this to 0 aka want a warm pool of 0, make sure to update target state
+		dynWarmIPReq = 2
+	}
+	return dynWarmIPReq
 }
 
 func getMinimumIPTarget() int {
@@ -1793,6 +1841,10 @@ func usePrefixDelegation() bool {
 
 func isIPv4Enabled() bool {
 	return getEnvBoolWithDefault(envEnableIPv4, false)
+}
+
+func isDynWarmPoolEnabled() bool {
+	return getEnvBoolWithDefault(envEnableDynWarmPool, false)
 }
 
 func isIPv6Enabled() bool {
@@ -2336,6 +2388,12 @@ func (c *IPAMContext) isConfigValid() bool {
 		return false
 	} else if !c.enableIPv4 && !c.enableIPv6 {
 		log.Errorf("IPv4 and IPv6 are both disabled. One of them have to be enabled")
+		return false
+	}
+
+	if c.enableDynWarmPool && (c.enablePodENI || c.useCustomNetworking || c.enablePrefixDelegation || c.enableIPv6) {
+		log.Errorf("Dynamic Warm Pool is supported only in IPv4 mode. Security Group Per Pod and " +
+			"Custom Networking are not supported. Please set the env variables accordingly.")
 		return false
 	}
 
