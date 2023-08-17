@@ -1,0 +1,61 @@
+package warm_pool
+
+import (
+	"fmt"
+	"github.com/aws/amazon-vpc-cni-k8s/test/framework/resources/k8s/manifest"
+	"github.com/aws/amazon-vpc-cni-k8s/test/framework/utils"
+	v1 "k8s.io/api/core/v1"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+)
+
+var primaryNode v1.Node
+
+var _ = Describe("use case 1", func() {
+	Context("Quick Scale Up and Down", func() {
+
+		BeforeEach(func() {
+			By("Getting Warm Pool Environment Variables Before Test")
+			getWarmPoolEnvVars()
+		})
+
+		It("Scales the cluster and checks warm pool before and after", func() {
+			fmt.Fprintf(GinkgoWriter, "Deploying %v minimum pods\n", minPods)
+			deploymentSpec := manifest.NewBusyBoxDeploymentBuilder(f.Options.TestImageRegistry).
+				Namespace("default").
+				Name("busybox").
+				NodeName(primaryNode.Name).
+				Namespace(utils.DefaultTestNamespace).
+				Replicas(minPods).
+				Build()
+
+			_, err := f.K8sResourceManagers.
+				DeploymentManager().
+				CreateAndWaitTillDeploymentIsReady(deploymentSpec, utils.DefaultDeploymentReadyTimeout*5)
+			Expect(err).ToNot(HaveOccurred())
+
+			if minPods != 0 {
+				time.Sleep(sleep)
+			}
+
+			fmt.Fprintf(GinkgoWriter, "Scaling cluster up to %v pods\n", maxPods)
+			quickScale(maxPods)
+
+			Expect(maxPods).To(Equal(busyboxPodCnt()))
+
+			fmt.Fprintf(GinkgoWriter, "Scaling cluster down to %v pods\n", minPods)
+			quickScale(minPods)
+
+			By("Deleting the deployment")
+			err = f.K8sResourceManagers.DeploymentManager().DeleteAndWaitTillDeploymentIsDeleted(deploymentSpec)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			By("Getting Warm Pool Environment Variables After Test")
+			getWarmPoolEnvVars()
+		})
+	})
+})
