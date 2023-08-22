@@ -1518,7 +1518,10 @@ func (c *IPAMContext) eniIPPoolReconcile(ipPool []string, attachedENI awsutils.E
 			// continue instead of bailout due to one ip
 			continue
 		}
+
+		// Prometheus metrics
 		reconcileCnt.With(prometheus.Labels{"fn": "eniIPPoolReconcileDel"}).Inc()
+		c.dataStore.GetENIUtilization()
 	}
 }
 
@@ -1634,7 +1637,9 @@ func (c *IPAMContext) verifyAndAddIPsToDatastore(eni string, attachedENIIPs []*e
 		}
 		// Mark action
 		seenIPs[strPrivateIPv4] = true
+		// Prometheus metrics
 		reconcileCnt.With(prometheus.Labels{"fn": "eniDataStorePoolReconcileAdd"}).Inc()
+		c.dataStore.GetENIUtilization()
 	}
 	return seenIPs
 }
