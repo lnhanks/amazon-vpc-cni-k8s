@@ -147,6 +147,9 @@ const (
 	envWarmPrefixTarget     = "WARM_PREFIX_TARGET"
 	defaultWarmPrefixTarget = 0
 
+	//envEnableDynWarmPool Env variable to enable/disable dynamic warm pool for IPv4 mode
+	envEnableDynWarmPool = "ENABLE_DYNAMIC_WARM_POOL"
+
 	//envEnableIPv4 - Env variable to enable/disable IPv4 mode
 	envEnableIPv4 = "ENABLE_IPv4"
 
@@ -272,6 +275,7 @@ type IPAMContext struct {
 	lastInsufficientCidrError time.Time
 	enableManageUntaggedMode  bool
 	enablePodIPAnnotation     bool
+	enableDynWarmPool         bool
 }
 
 // setUnmanagedENIs will rebuild the set of ENI IDs for ENIs tagged as "no_manage"
@@ -390,6 +394,7 @@ func New(rawK8SClient client.Client, cachedK8SClient client.Client) (*IPAMContex
 	c.useCustomNetworking = UseCustomNetworkCfg()
 	c.manageENIsNonScheduleable = ManageENIsOnNonSchedulableNode()
 	c.enablePrefixDelegation = usePrefixDelegation()
+	c.enableDynWarmPool = isDynWarmPoolEnabled()
 	c.enableIPv4 = isIPv4Enabled()
 	c.enableIPv6 = isIPv6Enabled()
 	c.disableENIProvisioning = disableENIProvisioning()
@@ -403,7 +408,6 @@ func New(rawK8SClient client.Client, cachedK8SClient client.Client) (*IPAMContex
 	c.reconcileCooldownCache.cache = make(map[string]time.Time)
 	// WARM and Min IP/Prefix targets are ignored in IPv6 mode
 	c.warmENITarget = getWarmENITarget()
-	c.warmIPTarget = getWarmIPTarget()
 	c.minimumIPTarget = getMinimumIPTarget()
 	c.warmPrefixTarget = getWarmPrefixTarget()
 	c.enablePodENI = enablePodENI()
@@ -425,6 +429,13 @@ func New(rawK8SClient client.Client, cachedK8SClient client.Client) (*IPAMContex
 	c.myNodeName = os.Getenv(envNodeName)
 	checkpointer := datastore.NewJSONFile(dsBackingStorePath())
 	c.dataStore = datastore.NewDataStore(log, checkpointer, c.enablePrefixDelegation)
+
+	// Dynamic Warm Pool Mode
+	if c.enableDynWarmPool {
+		c.warmIPTarget = c.dataStore.DynWarmPoolManager.GetWarmIPTarget()
+	} else {
+		c.warmIPTarget = getWarmIPTarget()
+	}
 
 	if err := c.nodeInit(); err != nil {
 		return nil, err
@@ -680,6 +691,9 @@ func (c *IPAMContext) StartNodeIPPoolManager() {
 	for {
 		if !c.disableENIProvisioning {
 			time.Sleep(sleepDuration)
+			if c.enableDynWarmPool {
+				c.warmIPTarget = c.dataStore.DynWarmPoolManager.GetWarmIPTarget()
+			}
 			c.updateIPPoolIfRequired(ctx)
 		}
 		time.Sleep(sleepDuration)
@@ -698,6 +712,8 @@ func (c *IPAMContext) updateIPPoolIfRequired(ctx context.Context) {
 	if c.shouldRemoveExtraENIs() {
 		c.tryFreeENI()
 	}
+	// Prometheus Metric
+	c.dataStore.GetENIUtilization()
 }
 
 // decreaseDatastorePool runs every `interval` and attempts to return unused ENIs and IPs
@@ -1807,6 +1823,10 @@ func enablePodIPAnnotation() bool {
 	return getEnvBoolWithDefault(envAnnotatePodIP, false)
 }
 
+func isDynWarmPoolEnabled() bool {
+	return getEnvBoolWithDefault(envEnableDynWarmPool, false)
+}
+
 // filterUnmanagedENIs filters out ENIs marked with the "node.k8s.amazonaws.com/no_manage" tag
 func (c *IPAMContext) filterUnmanagedENIs(enis []awsutils.ENIMetadata) []awsutils.ENIMetadata {
 	numFiltered := 0
@@ -2343,6 +2363,12 @@ func (c *IPAMContext) isConfigValid() bool {
 	if c.enableIPv6 && (c.enablePodENI || c.useCustomNetworking || !c.enablePrefixDelegation) {
 		log.Errorf("IPv6 is supported only in Prefix Delegation mode. Security Group Per Pod and " +
 			"Custom Networking are not supported in IPv6 mode. Please set the env variables accordingly.")
+		return false
+	}
+
+	if c.enableDynWarmPool && (c.enablePodENI || c.useCustomNetworking || c.enablePrefixDelegation || c.enableIPv6) {
+		log.Errorf("Dynamic Warm Pool is supported only in IPv4 mode. Security Group Per Pod and " +
+			"Custom Networking are not supported. Please set the env variables accordingly.")
 		return false
 	}
 
