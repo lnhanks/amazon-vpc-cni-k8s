@@ -27,6 +27,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/logger"
+	"github.com/aws/amazon-vpc-cni-k8s/utils"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -37,9 +38,8 @@ const (
 	// minENILifeTime is the shortest time before we consider deleting a newly created ENI
 	minENILifeTime = 1 * time.Minute
 
-	// addressCoolingPeriod is used to ensure an IP not get assigned to a Pod if this IP is used by a different Pod
-	// in addressCoolingPeriod
-	addressCoolingPeriod = 30 * time.Second
+	// envIPCooldownPeriod (default 30 seconds) specifies the time after pod deletion before an IP can be assigned to a new pod
+	envIPCooldownPeriod = "IP_COOLDOWN_PERIOD"
 
 	// DuplicatedENIError is an error when caller tries to add an duplicate ENI to data store
 	DuplicatedENIError = "data store: duplicate ENI"
@@ -124,18 +124,18 @@ var (
 		},
 		[]string{"cidr"},
 	)
-	noAvailableAddrs = prometheus.NewCounter(
+	noAvailableIPAddrs = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "awscni_err_no_avail_addrs",
-			Help: "The number of IP/Prefix assignments that fail due to no available addresses at the ENI level",
+			Help: "The number of pod IP assignments that fail due to no available IP addresses",
 		},
 	)
-	eniUtilization = prometheus.NewGaugeVec(
+	eniIPsInUse = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "awscni_eni_util",
 			Help: "The number of allocated ips partitioned by eni",
 		},
-		[]string{"fn"},
+		[]string{"eni"},
 	)
 	prometheusRegistered = false
 )
@@ -264,12 +264,12 @@ type CidrStats struct {
 }
 
 // Gets number of assigned IPs and the IPs in cooldown from a given CIDR
-func (cidr *CidrInfo) GetIPStatsFromCidr() CidrStats {
+func (cidr *CidrInfo) GetIPStatsFromCidr(ipCooldownPeriod time.Duration) CidrStats {
 	stats := CidrStats{}
 	for _, addr := range cidr.IPAddresses {
 		if addr.Assigned() {
 			stats.AssignedIPs++
-		} else if addr.inCoolingPeriod() {
+		} else if addr.inCoolingPeriod(ipCooldownPeriod) {
 			stats.CooldownIPs++
 		}
 	}
@@ -281,9 +281,18 @@ func (addr AddressInfo) Assigned() bool {
 	return !addr.IPAMKey.IsZero()
 }
 
-// InCoolingPeriod checks whether an addr is in addressCoolingPeriod
-func (addr AddressInfo) inCoolingPeriod() bool {
-	return time.Since(addr.UnassignedTime) <= addressCoolingPeriod
+// getCooldownPeriod returns the time duration in seconds configured by the IP_COOLDOWN_PERIOD env variable
+func getCooldownPeriod() time.Duration {
+	cooldownVal, err, _ := utils.GetIntFromStringEnvVar(envIPCooldownPeriod, 30)
+	if err != nil {
+		return 30 * time.Second
+	}
+	return time.Duration(cooldownVal) * time.Second
+}
+
+// InCoolingPeriod checks whether an addr is in ipCooldownPeriod
+func (addr AddressInfo) inCoolingPeriod(ipCooldownPeriod time.Duration) bool {
+	return time.Since(addr.UnassignedTime) <= ipCooldownPeriod
 }
 
 // ENIPool is a collection of ENI, keyed by ENI ID
@@ -329,6 +338,7 @@ type DataStore struct {
 	netLink            netlinkwrapper.NetLink
 	isPDEnabled        bool
 	DynWarmPoolManager *DynamicWarmPoolManager
+	ipCooldownPeriod   time.Duration
 }
 
 // ENIInfos contains ENI IP information
@@ -350,8 +360,8 @@ func prometheusRegister() {
 		prometheus.MustRegister(forceRemovedIPs)
 		prometheus.MustRegister(totalPrefixes)
 		prometheus.MustRegister(ipsPerCidr)
-		prometheus.MustRegister(noAvailableAddrs)
-		prometheus.MustRegister(eniUtilization)
+		prometheus.MustRegister(noAvailableIPAddrs)
+		prometheus.MustRegister(eniIPsInUse)
 		prometheusRegistered = true
 	}
 }
@@ -444,7 +454,11 @@ func (ds *DataStore) ReadBackingStore(isv6Enabled bool) error {
 					addr := &AddressInfo{Address: ipAddr.String()}
 					cidr.IPAddresses[ipAddr.String()] = addr
 					ds.assignPodIPAddressUnsafe(addr, allocation.IPAMKey, allocation.Metadata, time.Unix(0, allocation.AllocationTimestamp))
+					// Increment ENI IP usage upon finding assigned ips
+					eniIPsInUse.WithLabelValues(eni.ID).Inc()
 					ds.log.Debugf("Recovered %s => %s/%s", allocation.IPAMKey, eni.ID, addr.Address)
+					// Increment ENI IP usage upon finding assigned ips
+					eniIPsInUse.WithLabelValues(eni.ID).Inc()
 					// Update prometheus for ips per cidr
 					// Secondary IP mode will have /32:1 and Prefix mode will have /28:<number of /32s>
 					ipsPerCidr.With(prometheus.Labels{"cidr": cidr.Cidr.String()}).Inc()
@@ -529,8 +543,9 @@ func (ds *DataStore) AddENI(eniID string, deviceNumber int, isPrimary, isTrunk, 
 		DeviceNumber:       deviceNumber,
 		AvailableIPv4Cidrs: make(map[string]*CidrInfo)}
 
-	ds.GetENIUtilization()
 	enis.Set(float64(len(ds.eniPool)))
+	// Initialize ENI IPs In Use to 0 when an ENI is created
+	eniIPsInUse.WithLabelValues(eniID).Set(0)
 	return nil
 }
 
@@ -720,10 +735,12 @@ func (ds *DataStore) AssignPodIPv6Address(ipamKey IPAMKey, ipamMetadata IPAMMeta
 				delete(V6Cidr.IPAddresses, addr.Address)
 				return "", -1, err
 			}
+			// Increment ENI IP usage on pod IPv6 allocation
+			eniIPsInUse.WithLabelValues(eni.ID).Inc()
 			return addr.Address, eni.DeviceNumber, nil
 		}
 	}
-	noAvailableAddrs.Inc()
+	noAvailableIPAddrs.Inc()
 	return "", -1, errors.New("assignPodIPv6AddressUnsafe: no available IP addresses")
 }
 
@@ -786,12 +803,14 @@ func (ds *DataStore) AssignPodIPv4Address(ipamKey IPAMKey, ipamMetadata IPAMMeta
 				ipsPerCidr.With(prometheus.Labels{"cidr": availableCidr.Cidr.String()}).Dec()
 				return "", -1, err
 			}
+			// Increment ENI IP usage on pod IPv4 allocation
+			eniIPsInUse.WithLabelValues(eni.ID).Inc()
 			return addr.Address, eni.DeviceNumber, nil
 		}
 		ds.log.Debugf("AssignPodIPv4Address: ENI %s does not have available addresses", eni.ID)
 	}
 
-	noAvailableAddrs.Inc()
+	noAvailableIPAddrs.Inc()
 	ds.log.Errorf("DataStore has no available IP/Prefix addresses")
 	return "", -1, errors.New("assignPodIPv4AddressUnsafe: no available IP/Prefix addresses")
 }
@@ -870,7 +889,7 @@ func (ds *DataStore) GetIPStats(addressFamily string) *DataStoreStats {
 		}
 		for _, cidr := range AssignedCIDRs {
 			if addressFamily == "4" && ((ds.isPDEnabled && cidr.IsPrefix) || (!ds.isPDEnabled && !cidr.IsPrefix)) {
-				cidrStats := cidr.GetIPStatsFromCidr()
+				cidrStats := cidr.GetIPStatsFromCidr(ds.ipCooldownPeriod)
 				stats.AssignedIPs += cidrStats.AssignedIPs
 				stats.CooldownIPs += cidrStats.CooldownIPs
 				stats.TotalIPs += cidr.Size()
@@ -881,24 +900,6 @@ func (ds *DataStore) GetIPStats(addressFamily string) *DataStoreStats {
 		}
 	}
 	return stats
-}
-
-// GetENIUtilization updates a Prometheus gauge vector with each ENIs id and how many ip addresses are assigned on it
-func (ds *DataStore) GetENIUtilization() {
-	eniUtilization.Reset() // May need to reset so if an ENI is detached it won't persist in the metrics
-	for _, eni := range ds.eniPool {
-		count := 0
-		for _, assignedAddr := range eni.AvailableIPv4Cidrs {
-			for _, addr := range assignedAddr.IPAddresses {
-				if addr.Assigned() {
-					count += 1
-				}
-			}
-		}
-		utilization := count
-		eniID := eni.ID
-		eniUtilization.WithLabelValues(eniID).Set(float64(utilization))
-	}
 }
 
 // GetTrunkENI returns the trunk ENI ID or an empty string
@@ -998,7 +999,7 @@ func (ds *DataStore) getDeletableENI(warmIPTarget, minimumIPTarget, warmPrefixTa
 			continue
 		}
 
-		if eni.hasIPInCooling() {
+		if eni.hasIPInCooling(ds.ipCooldownPeriod) {
 			ds.log.Debugf("ENI %s cannot be deleted because has IPs in cooling", eni.ID)
 			continue
 		}
@@ -1045,10 +1046,10 @@ func (e *ENI) isTooYoung() bool {
 }
 
 // HasIPInCooling returns true if an IP address was unassigned recently.
-func (e *ENI) hasIPInCooling() bool {
+func (e *ENI) hasIPInCooling(ipCooldownPeriod time.Duration) bool {
 	for _, assignedaddr := range e.AvailableIPv4Cidrs {
 		for _, addr := range assignedaddr.IPAddresses {
-			if addr.inCoolingPeriod() {
+			if addr.inCoolingPeriod(ipCooldownPeriod) {
 				return true
 			}
 		}
@@ -1106,8 +1107,9 @@ func (ds *DataStore) RemoveUnusedENIFromStore(warmIPTarget, minimumIPTarget, war
 	delete(ds.eniPool, removableENI)
 
 	// Prometheus update
-	ds.GetENIUtilization()
 	enis.Set(float64(len(ds.eniPool)))
+	// Delete ENI IPs In Use when ENI is removed
+	eniIPsInUse.DeleteLabelValues(removableENI)
 	totalIPs.Set(float64(ds.total))
 	return removableENI
 }
@@ -1161,8 +1163,9 @@ func (ds *DataStore) RemoveENIFromDataStore(eniID string, force bool) error {
 	delete(ds.eniPool, eniID)
 
 	// Prometheus gauge
-	ds.GetENIUtilization()
 	enis.Set(float64(len(ds.eniPool)))
+	// Delete ENI IPs In Use when ENI is removed
+	eniIPsInUse.DeleteLabelValues(eniID)
 	return nil
 }
 
@@ -1203,6 +1206,8 @@ func (ds *DataStore) UnassignPodIPAddress(ipamKey IPAMKey) (e *ENI, ip string, d
 	ipsPerCidr.With(prometheus.Labels{"cidr": availableCidr.Cidr.String()}).Dec()
 	ds.log.Infof("UnassignPodIPAddress: sandbox %s's ipAddr %s, DeviceNumber %d",
 		ipamKey, addr.Address, eni.DeviceNumber)
+	// Decrement ENI IP usage when a pod is deallocated
+	eniIPsInUse.WithLabelValues(eni.ID).Dec()
 	return eni, addr.Address, eni.DeviceNumber, nil
 }
 
@@ -1403,7 +1408,7 @@ func (ds *DataStore) getUnusedIP(availableCidr *CidrInfo) (string, error) {
 	//Check if there is any IP out of cooldown
 	var cachedIP string
 	for _, addr := range availableCidr.IPAddresses {
-		if !addr.Assigned() && !addr.inCoolingPeriod() {
+		if !addr.Assigned() && !addr.inCoolingPeriod(ds.ipCooldownPeriod) {
 			//if the IP is out of cooldown and not assigned then cache the first available IP
 			//continue cleaning up the DB, this is to avoid stale entries and a new thread :)
 			if cachedIP == "" {
